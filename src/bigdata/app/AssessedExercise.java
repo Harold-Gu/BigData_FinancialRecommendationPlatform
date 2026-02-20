@@ -198,28 +198,21 @@ public static void main(String[] args) throws InterruptedException {
 							return null; // 数据不足，稍后过滤掉
 						}
 
-						// 截取最近的 251 天和 5 天的数据
 						List<StockPrice> last251StockPrices = priceList.subList(priceList.size() - 251, priceList.size());
-						List<StockPrice> last5StockPrices = priceList.subList(priceList.size() - 5, priceList.size());
-
-						// 提取收盘价 (Close Price) 列表，因为计算类通常需要这个 [cite: 79, 89]
 						List<Double> last251ClosePrices = new ArrayList<>();
 						for (StockPrice sp : last251StockPrices) {
 							last251ClosePrices.add(sp.getClosePrice());
 						}
 
-						List<Double> last5ClosePrices = new ArrayList<>();
-						for (StockPrice sp : last5StockPrices) {
-							last5ClosePrices.add(sp.getClosePrice());
-						}
 
 						// 计算指标
-						// 注意：这里假设 Volatility.calculate 和 Returns.calculate 接收 List<Double>。
-						// 任务书提到 Returns.calculate 接收天数 (5) 和排序好的收盘价列表 [cite: 79, 80]
+						// 计算指标
 						double volatility = Volitility.calculate(last251ClosePrices);
-						double returns = Returns.calculate(5, last5ClosePrices);
 
-						// 封装到 AssetFeatures，注意使用源码中拼写正确的 setAssetVolitility
+						// 核心修复：直接将 last251ClosePrices 传给 Returns，让它自己根据天数 5 去寻找历史价格
+						double returns = Returns.calculate(5, last251ClosePrices);
+
+						// 封装到 AssetFeatures
 						AssetFeatures features = new AssetFeatures();
 						features.setAssetVolitility(volatility);
 						features.setAssetReturn(returns);
@@ -289,13 +282,8 @@ public static void main(String[] args) throws InterruptedException {
 		);
 
 		// 8. 排序并收集前 5 名资产 (基于回报率降序排列)
-		List<Asset> top5 = finalAssets.takeOrdered(5, new Comparator<Asset>() {
-			@Override
-			public int compare(Asset a1, Asset a2) {
-				// a2 相比 a1 进行比较，实现降序排列 (最高回报率在前)
-				return Double.compare(a2.getFeatures().getAssetReturn(), a1.getFeatures().getAssetReturn());
-			}
-		});
+		// 使用支持序列化的自定义比较器
+		List<Asset> top5 = finalAssets.takeOrdered(5, new AssetReturnComparator());
 
 		// 9. 将结果封装进 AssetRanking 并返回
 		AssetRanking finalRanking = new AssetRanking(); // 构造函数默认初始化了长度为 5 的数组
@@ -309,6 +297,16 @@ public static void main(String[] args) throws InterruptedException {
 		// 注入到最终的 Ranking 对象中
 		finalRanking.setAssetRanking(top5Array);
 		return finalRanking;
+	}
+
+	public static class AssetReturnComparator implements java.util.Comparator<Asset>, java.io.Serializable {
+		private static final long serialVersionUID = 1L;
+
+		@Override
+		public int compare(Asset a1, Asset a2) {
+			// a2 相比 a1 进行比较，实现降序排列 (最高回报率在前)
+			return Double.compare(a2.getFeatures().getAssetReturn(), a1.getFeatures().getAssetReturn());
+		}
 	}
 	
 }
