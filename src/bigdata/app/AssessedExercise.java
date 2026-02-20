@@ -23,6 +23,23 @@ import bigdata.transformations.filters.NullPriceFilter;
 import bigdata.transformations.maps.PriceReaderMap;
 import bigdata.transformations.pairing.AssetMetadataPairing;
 
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.function.Function;
+import org.apache.spark.api.java.function.PairFunction;
+import scala.Tuple2;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import bigdata.objects.Asset;
+import bigdata.objects.AssetFeatures;
+
+import bigdata.util.TimeUtil;
+import bigdata.technicalindicators.Returns;
+import bigdata.technicalindicators.Volitility;
+
+
 public class AssessedExercise {
 
 public static void main(String[] args) throws InterruptedException {
@@ -129,21 +146,169 @@ public static void main(String[] args) throws InterruptedException {
 	}
 
 
-    public static AssetRanking rankInvestments(SparkSession spark, JavaPairRDD<String, AssetMetadata> assetMetadata, Dataset<StockPrice> prices, String datasetEndDate, double volatilityCeiling, double peRatioThreshold) {
-    	
-    	//----------------------------------------
-    	// Student's solution starts here
-    	//----------------------------------------
-    	
-    	
-    	
-    	
-    	AssetRanking finalRanking = new AssetRanking(); // ...One of these is what your Spark program should collect
-    	
-    	return finalRanking;
-    	
-    	
-    	
-    }
+	public static AssetRanking rankInvestments(SparkSession spark, JavaPairRDD<String, AssetMetadata> assetMetadata, Dataset<StockPrice> prices, String datasetEndDate, double volatilityCeiling, double peRatioThreshold) {
+
+		//----------------------------------------
+		// Student's solution starts here
+		//----------------------------------------
+
+		// 解析目标截止日期，使用 TimeUtil
+		final Instant endDate = TimeUtil.fromDate(datasetEndDate);
+
+		// 1. 将 Dataset<StockPrice> 转换为以股票代码 (Ticker) 为键的 JavaPairRDD
+		JavaPairRDD<String, StockPrice> pairedPrices = prices.toJavaRDD().mapToPair(
+				new PairFunction<StockPrice, String, StockPrice>() {
+					@Override
+					public Tuple2<String, StockPrice> call(StockPrice sp) throws Exception {
+						return new Tuple2<>(sp.getStockTicker(), sp);
+					}
+				}
+		);
+
+		// 2. 按股票代码对价格记录进行分组
+		JavaPairRDD<String, Iterable<StockPrice>> groupedPrices = pairedPrices.groupByKey();
+
+		// 3. 计算技术指标 (波动率和回报率)
+		JavaPairRDD<String, AssetFeatures> featuresRDD = groupedPrices.mapValues(
+				new Function<Iterable<StockPrice>, AssetFeatures>() {
+					@Override
+					public AssetFeatures call(Iterable<StockPrice> priceIter) throws Exception {
+						List<StockPrice> priceList = new ArrayList<>();
+
+						// 过滤掉晚于 datasetEndDate 的数据点 [cite: 13]
+						for (StockPrice sp : priceIter) {
+							Instant priceDate = TimeUtil.fromDate(sp.getYear(), sp.getMonth(), sp.getDay());
+							if (!priceDate.isAfter(endDate)) {
+								priceList.add(sp);
+							}
+						}
+
+						// 按时间升序排序
+						Collections.sort(priceList, new Comparator<StockPrice>() {
+							@Override
+							public int compare(StockPrice p1, StockPrice p2) {
+								Instant t1 = TimeUtil.fromDate(p1.getYear(), p1.getMonth(), p1.getDay());
+								Instant t2 = TimeUtil.fromDate(p2.getYear(), p2.getMonth(), p2.getDay());
+								return t1.compareTo(t2);
+							}
+						});
+
+						// 波动率需要前一年的251天交易数据 [cite: 90]
+						if (priceList.size() < 251) {
+							return null; // 数据不足，稍后过滤掉
+						}
+
+						// 截取最近的 251 天和 5 天的数据
+						List<StockPrice> last251StockPrices = priceList.subList(priceList.size() - 251, priceList.size());
+						List<StockPrice> last5StockPrices = priceList.subList(priceList.size() - 5, priceList.size());
+
+						// 提取收盘价 (Close Price) 列表，因为计算类通常需要这个 [cite: 79, 89]
+						List<Double> last251ClosePrices = new ArrayList<>();
+						for (StockPrice sp : last251StockPrices) {
+							last251ClosePrices.add(sp.getClosePrice());
+						}
+
+						List<Double> last5ClosePrices = new ArrayList<>();
+						for (StockPrice sp : last5StockPrices) {
+							last5ClosePrices.add(sp.getClosePrice());
+						}
+
+						// 计算指标
+						// 注意：这里假设 Volatility.calculate 和 Returns.calculate 接收 List<Double>。
+						// 任务书提到 Returns.calculate 接收天数 (5) 和排序好的收盘价列表 [cite: 79, 80]
+						double volatility = Volitility.calculate(last251ClosePrices);
+						double returns = Returns.calculate(5, last5ClosePrices);
+
+						// 封装到 AssetFeatures，注意使用源码中拼写正确的 setAssetVolitility
+						AssetFeatures features = new AssetFeatures();
+						features.setAssetVolitility(volatility);
+						features.setAssetReturn(returns);
+						return features;
+					}
+				}
+		);
+
+		// 过滤掉因为数据量不足 (<251天) 而导致计算返回 null 的资产
+		featuresRDD = featuresRDD.filter(
+				new Function<Tuple2<String, AssetFeatures>, Boolean>() {
+					@Override
+					public Boolean call(Tuple2<String, AssetFeatures> tuple) throws Exception {
+						return tuple._2() != null;
+					}
+				}
+		);
+
+		// 4. 初步筛选：移除波动率 >= 4 的资产 [cite: 19]
+		JavaPairRDD<String, AssetFeatures> validVolatilityRDD = featuresRDD.filter(
+				new Function<Tuple2<String, AssetFeatures>, Boolean>() {
+					@Override
+					public Boolean call(Tuple2<String, AssetFeatures> tuple) throws Exception {
+						return tuple._2().getAssetVolitility() < volatilityCeiling;
+					}
+				}
+		);
+
+		// 5. 将技术特征与资产元数据关联 (Join)
+		JavaPairRDD<String, Tuple2<AssetFeatures, AssetMetadata>> joinedRDD = validVolatilityRDD.join(assetMetadata);
+
+		// 6. 二次筛选：移除市盈率 (P/E Ratio) >= 25 的资产
+		JavaPairRDD<String, Tuple2<AssetFeatures, AssetMetadata>> finalFilteredRDD = joinedRDD.filter(
+				new Function<Tuple2<String, Tuple2<AssetFeatures, AssetMetadata>>, Boolean>() {
+					@Override
+					public Boolean call(Tuple2<String, Tuple2<AssetFeatures, AssetMetadata>> tuple) throws Exception {
+						AssetMetadata meta = tuple._2()._2();
+
+						double peRatio = meta.getPriceEarningRatio();
+
+						// 任务书要求：如果需要某个字段而该资产缺失该字段，则应将其过滤掉
+						// 在 Java 中基础 double 缺失时的默认值是 0.0
+						if (peRatio == 0.0) {
+							return false;
+						}
+						return peRatio < peRatioThreshold;
+					}
+				}
+		);
+
+		// 7. 将筛选后的数据映射为最终的 Asset 对象
+		JavaRDD<Asset> finalAssets = finalFilteredRDD.map(
+				new Function<Tuple2<String, Tuple2<AssetFeatures, AssetMetadata>>, Asset>() {
+					@Override
+					public Asset call(Tuple2<String, Tuple2<AssetFeatures, AssetMetadata>> tuple) throws Exception {
+						String ticker = tuple._1();
+						AssetFeatures features = tuple._2()._1();
+						AssetMetadata meta = tuple._2()._2();
+
+						// 为了保持数据完整，将 PE Ratio 写入 features
+						features.setPeRatio(meta.getPriceEarningRatio());
+
+						// 使用 Asset.java 提供的全参构造函数
+						return new Asset(ticker, features, meta.getName(), meta.getIndustry(), meta.getSector());
+					}
+				}
+		);
+
+		// 8. 排序并收集前 5 名资产 (基于回报率降序排列)
+		List<Asset> top5 = finalAssets.takeOrdered(5, new Comparator<Asset>() {
+			@Override
+			public int compare(Asset a1, Asset a2) {
+				// a2 相比 a1 进行比较，实现降序排列 (最高回报率在前)
+				return Double.compare(a2.getFeatures().getAssetReturn(), a1.getFeatures().getAssetReturn());
+			}
+		});
+
+		// 9. 将结果封装进 AssetRanking 并返回
+		AssetRanking finalRanking = new AssetRanking(); // 构造函数默认初始化了长度为 5 的数组
+
+		// 将 List 转换为固定长度为 5 的数组
+		Asset[] top5Array = new Asset[5];
+		for (int i = 0; i < Math.min(top5.size(), 5); i++) {
+			top5Array[i] = top5.get(i);
+		}
+
+		// 注入到最终的 Ranking 对象中
+		finalRanking.setAssetRanking(top5Array);
+		return finalRanking;
+	}
 	
 }
