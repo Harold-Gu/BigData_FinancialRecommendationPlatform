@@ -152,28 +152,24 @@ public static void main(String[] args) throws InterruptedException {
 		// Student's solution starts here
 		//----------------------------------------
 
-		// 1. 提前解析截止日期为原生的 short 类型，避免后续的任何字符串解析
+		// Parse the deadline date in advance as the native 'short' type to avoid any subsequent string parsing issues.
 		String[] dateParts = datasetEndDate.split("-");
 		final short endYear = Short.parseShort(dateParts[0]);
 		final short endMonth = Short.parseShort(dateParts[1]);
 		final short endDay = Short.parseShort(dateParts[2]);
 
-		// 2. 极限谓词下推：时间窗口双向剪枝 (Dual-Bound Pruning)
+
 		JavaPairRDD<String, StockPrice> pairedPrices = prices.toJavaRDD()
 				.filter(new Function<StockPrice, Boolean>() {
 					@Override
 					public Boolean call(StockPrice sp) throws Exception {
-						// 1. 过滤掉未来的数据 (你之前的代码)
+						// Filter the data
 						if (sp.getYear() > endYear) return false;
 						if (sp.getYear() == endYear && sp.getMonth() > endMonth) return false;
 						if (sp.getYear() == endYear && sp.getMonth() == endMonth && sp.getDay() > endDay) return false;
 
-						// 2. 【核弹级优化】：过滤掉远古数据
-						// 任务只需要过去 251 个交易日（约 1 个自然年）。
-						// 我们直接丢弃比 endYear 早 2 年以上的所有数据！
-						// 这将直接消除近 90% 的无效网络 Shuffle 和 排序开销。
+						// Just for the past 251 trading days, simply discard all the data that is more than 2 years earlier than the endYear.
 						if (sp.getYear() < endYear - 2) return false;
-
 						return true;
 					}
 				})
@@ -184,10 +180,10 @@ public static void main(String[] args) throws InterruptedException {
 					}
 				});
 
-		// 3. 按股票代码对价格记录进行分组
+		// Group the price records by stock code
 		JavaPairRDD<String, Iterable<StockPrice>> groupedPrices = pairedPrices.groupByKey();
 
-		// 4. 计算指标与底层深度过滤 (核心加速区)
+		// Computational indicators and underlying deep filtering
 		JavaPairRDD<String, AssetFeatures> featuresRDD = groupedPrices.mapValues(
 				new Function<Iterable<StockPrice>, AssetFeatures>() {
 					@Override
@@ -197,12 +193,11 @@ public static void main(String[] args) throws InterruptedException {
 							priceList.add(sp);
 						}
 
-						//
 						if (priceList.size() < 251) {
 							return null;
 						}
 
-						// 【性能核武器】使用原生 short 类型进行排序，彻底消除 TimeUtil 带来的对象开销
+						// Sort using the native short type
 						Collections.sort(priceList, new Comparator<StockPrice>() {
 							@Override
 							public int compare(StockPrice p1, StockPrice p2) {
@@ -212,20 +207,20 @@ public static void main(String[] args) throws InterruptedException {
 							}
 						});
 
-						// 仅提取最后 251 天的收盘价
+						// Extract only the closing prices for the last 251 days
 						List<StockPrice> last251StockPrices = priceList.subList(priceList.size() - 251, priceList.size());
 						List<Double> last251ClosePrices = new ArrayList<>(251);
 						for (StockPrice sp : last251StockPrices) {
 							last251ClosePrices.add(sp.getClosePrice());
 						}
 
-						// 【短路优化】先算波动率，如果 >= 4 就直接掐断，省去后续所有计算和对象创建
+						// First, calculate the volatility. If it is greater than or equal to 4, immediately terminate and skip all subsequent calculations and object creations.
 						double volatility = Volitility.calculate(last251ClosePrices);
 						if (volatility >= volatilityCeiling) {
 							return null;
 						}
 
-						// 如果活到了这一步，才去算回报率 (这里已经修复为你正确的 251 天传参)
+						// If you make it this far, then you should calculate the rate of return.
 						double returns = Returns.calculate(5, last251ClosePrices);
 						AssetFeatures features = new AssetFeatures();
 						features.setAssetVolitility(volatility);
@@ -235,7 +230,7 @@ public static void main(String[] args) throws InterruptedException {
 				}
 		);
 
-		// 5. 统一清理 null 数据 (包含了不足 251 天的，以及波动率超标的资产)
+		// Uniformly clean up null data (including those with less than 251 days and assets with excessive volatility)
 		JavaPairRDD<String, AssetFeatures> validFeaturesRDD = featuresRDD.filter(
 				new Function<Tuple2<String, AssetFeatures>, Boolean>() {
 					@Override
@@ -245,10 +240,10 @@ public static void main(String[] args) throws InterruptedException {
 				}
 		);
 
-		// 6. 关联元数据 (Join)
+		// Associated Metadata (Join)
 		JavaPairRDD<String, Tuple2<AssetFeatures, AssetMetadata>> joinedRDD = validFeaturesRDD.join(assetMetadata);
 
-		// 7. 过滤市盈率 (P/E Ratio)
+		// Filtering the price-earnings ratio (P/E Ratio)
 		JavaPairRDD<String, Tuple2<AssetFeatures, AssetMetadata>> finalFilteredRDD = joinedRDD.filter(
 				new Function<Tuple2<String, Tuple2<AssetFeatures, AssetMetadata>>, Boolean>() {
 					@Override
@@ -260,7 +255,7 @@ public static void main(String[] args) throws InterruptedException {
 				}
 		);
 
-		// 8. 映射为 Asset 对象
+		// Mapped to an Asset object
 		JavaRDD<Asset> finalAssets = finalFilteredRDD.map(
 				new Function<Tuple2<String, Tuple2<AssetFeatures, AssetMetadata>>, Asset>() {
 					@Override
@@ -274,7 +269,7 @@ public static void main(String[] args) throws InterruptedException {
 				}
 		);
 
-// 9. 去除异常值 NaN (双重保险)
+// Remove the outlier value NaN
 		finalAssets = finalAssets.filter(new Function<Asset, Boolean>() {
 			@Override
 			public Boolean call(Asset asset) throws Exception {
@@ -285,10 +280,10 @@ public static void main(String[] args) throws InterruptedException {
 			}
 		});
 
-		// 10. 排序并收集前 5 名 (关键修复：换回 takeOrdered 配合降序比较器)
+		// Sort and collect the top 5.
 		List<Asset> top5 = finalAssets.takeOrdered(5, new AssetReturnComparator());
 
-		// 11. 组装结果
+		// Assembly result
 		AssetRanking finalRanking = new AssetRanking();
 		Asset[] top5Array = new Asset[5];
 		for (int i = 0; i < Math.min(top5.size(), 5); i++) {
@@ -299,13 +294,12 @@ public static void main(String[] args) throws InterruptedException {
 		return finalRanking;
 	}
 
-	// 强制使用降序比较器 (最高回报率在前)
+	// Force the use of descending comparator
 	public static class AssetReturnComparator implements java.util.Comparator<Asset>, java.io.Serializable {
 		private static final long serialVersionUID = 1L;
 
 		@Override
 		public int compare(Asset a1, Asset a2) {
-			// 注意：一定要是 a2.get... 相比 a1.get...
 			return Double.compare(a2.getFeatures().getAssetReturn(), a1.getFeatures().getAssetReturn());
 		}
 	}
