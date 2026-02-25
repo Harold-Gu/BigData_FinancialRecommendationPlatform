@@ -107,9 +107,9 @@ public static void main(String[] args) throws InterruptedException {
 		
 		System.out.println(finalRanking.toString());
 		
-		System.out.println("Holding Spark UI open for 1 minute: http://localhost:4040");
+		// System.out.println("Holding Spark UI open for 1 minute: http://localhost:4040");
 		
-		Thread.sleep(60000);
+		// Thread.sleep(60000);
 		
 		// Close the spark session
 		spark.close();
